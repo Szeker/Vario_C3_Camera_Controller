@@ -1,235 +1,254 @@
 #include <Arduino.h>
-#include "BLEDevice.h"
+#include <esp_now.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <Wire.h>
+#include "Adafruit_VL53L0X.h"
+
 
 // Links:
 // https://michiel.vanderwulp.be/domotica/Modules/ESP32-C3-SuperMini/
 
+// Pin Definitions
+#define LED_ONBOARD 8
 
-#define LED_BOARD 8
+// I2C IMU definition
+#define I2C_IMU_SDA 10
+#define I2C_IMU_SCL 9
+
+// SCH definitions
+#define SCH_20MS_TASK_PERIOD   (20000)
+#define SCH_100MS_TASK_PERIOD (100000)
+#define SCH_500MS_TASK_PERIOD (500000)
+#define SENS_SAMPLING_TIME (float)((float)SCH_20MS_TASK_PERIOD/1000000.0f);
+
+// Global Variables
+
+// Scheduler variables
+uint32_t schTimeUs = 0;
+uint32_t schLast20msTaskExecutionUs = 0;
+uint32_t schLast100msTaskExecutionUs = 0;
+uint32_t schLast500msTaskExecutionUs = 0;
+
+// ESP-NOW variables
+#define dataLength 8
+uint8_t incomingData[dataLength] = {0, 0, 0, 0, 0, 0, 0, 0};
+uint8_t responseData[dataLength] = {0, 0, 0, 0, 0, 0, 0, 0};
+bool dataReceived = false;
+// Own MAC Address: 9c:9e:6e:f6:b9:40
+
+
+// LED Flag
 bool LEDFlag = true;
-bool serialReady = false;
+uint8_t LEDCounter = 0;
 
-// Define UUIDs:
-static BLEUUID serviceUUID("4fafc201-1fb5-459e-8fcc-c5c9c331914b");
-static BLEUUID    charUUID_1("beb5483e-36e1-4688-b7f5-ea07361b26a8");
-static BLEUUID    charUUID_2("1c95d5e3-d8f7-413a-bf3d-7a2e5d7be87e");
 
-// Some variables to keep track on device connected
-static boolean doConnect = false;
-static boolean connected = false;
-static boolean doScan = false;
+// Function Prototypes
+void schRun();
+void task_20ms();
+void task_100ms();
+void task_500ms();
+void readMacAddress();
 
-// Define pointer for the BLE connection
-static BLEAdvertisedDevice* myDevice;
-BLERemoteCharacteristic* pRemoteChar_1;
-BLERemoteCharacteristic* pRemoteChar_2;
 
-// Function declarations
-bool connectCharacteristic(BLERemoteService* pRemoteService, BLERemoteCharacteristic* l_BLERemoteChar);
+TwoWire I2CTOF = TwoWire(0);
+Adafruit_VL53L0X tof = Adafruit_VL53L0X();
 
-// Callback function for Notify function
-static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic,
-                            uint8_t* pData,
-                            size_t length,
-                            bool isNotify) {
-  if(pBLERemoteCharacteristic->getUUID().toString() == charUUID_1.toString()) {
 
-    // convert received bytes to integer
-    uint32_t counter = pData[0];
-    for(int i = 1; i<length; i++) {
-      counter = counter | (pData[i] << i*8);
+// TOF Sensor
+bool TOF_available = false;
+
+// Callback function that will be executed when data is received
+void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
+    dataReceived = true;
+    // Clear the receive buffer
+    for (int i = 0; i < dataLength; i++) {
+        incomingData[i] = 0;
     }
-
-    // print to Serial
-    Serial.print("Characteristic 1 (Notify) from server: ");
-    Serial.println(counter );  
-  }
-}
-
-// Callback function that is called whenever a client is connected or disconnected
-class MyClientCallback : public BLEClientCallbacks {
-  void onConnect(BLEClient* pclient) {
-    Serial.println("onCoonnect");
-  }
-
-  void onDisconnect(BLEClient* pclient) {
-    connected = false;
-    Serial.println("onDisconnect");
-  }
-};
-
-// Function that is run whenever the server is connected
-bool connectToServer() {
-  Serial.print("Forming a connection to ");
-  Serial.println(myDevice->getAddress().toString().c_str());
-  
-  BLEClient*  pClient  = BLEDevice::createClient();
-  Serial.println(" - Created client");
-
-  pClient->setClientCallbacks(new MyClientCallback());
-
-  // Connect to the remove BLE Server.
-  pClient->connect(myDevice);  // if you pass BLEAdvertisedDevice instead of address, it will be recognized type of peer device address (public or private)
-  Serial.println(" - Connected to server");
-
-  // Obtain a reference to the service we are after in the remote BLE server.
-  BLERemoteService* pRemoteService = pClient->getService(serviceUUID);
-  if (pRemoteService == nullptr) {
-    Serial.print("Failed to find our service UUID: ");
-    Serial.println(serviceUUID.toString().c_str());
-    pClient->disconnect();
-    return false;
-  }
-  Serial.println(" - Found our service");
-
-  connected = true;
-  pRemoteChar_1 = pRemoteService->getCharacteristic(charUUID_1);
-  pRemoteChar_2 = pRemoteService->getCharacteristic(charUUID_2);
-  if(connectCharacteristic(pRemoteService, pRemoteChar_1) == false)
-    connected = false;
-  else if(connectCharacteristic(pRemoteService, pRemoteChar_2) == false)
-    connected = false;
-
-  if(connected == false) {
-    pClient-> disconnect();
-    Serial.println("At least one characteristic UUID not found");
-    return false;
-  }
-  return true;
-}
-
-// Function to chech Characteristic
-bool connectCharacteristic(BLERemoteService* pRemoteService, BLERemoteCharacteristic* l_BLERemoteChar) {
-  // Obtain a reference to the characteristic in the service of the remote BLE server.
-  if (l_BLERemoteChar == nullptr) {
-    Serial.print("Failed to find one of the characteristics");
-    Serial.print(l_BLERemoteChar->getUUID().toString().c_str());
-    return false;
-  }
-  Serial.println(" - Found characteristic: " + String(l_BLERemoteChar->getUUID().toString().c_str()));
-
-  if(l_BLERemoteChar->canNotify())
-    l_BLERemoteChar->registerForNotify(notifyCallback);
-
-  return true;
-}
-
-// Scan for BLE servers and find the first one that advertises the service we are looking for.
-class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
-  //Called for each advertising BLE server.
-  void onResult(BLEAdvertisedDevice advertisedDevice) {
-    Serial.print("BLE Advertised Device found: ");
-    Serial.println(advertisedDevice.toString().c_str());
-  
-    // We have found a device, let us now see if it contains the service we are looking for.
-    if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(serviceUUID)) {
-      Serial.println("     BLE Service found: ");
-      BLEDevice::getScan()->stop();
-      myDevice = new BLEAdvertisedDevice(advertisedDevice);
-      doConnect = true;
-      doScan = true;
-  
-    }
-    else
+    
+    // Copy the received data to the buffer up to dataLength
+    Serial.print("RxD: ");
+    for (int i = 0; (i < len) && (i < dataLength); i++)
     {
-      Serial.println("     BLE Service NOT found: ");
-    } // Found our server
-  } // onResult
-}; // MyAdvertisedDeviceCallbacks
+        incomingData[i] = data[i];
+        Serial.print(data[i]);
+        Serial.print(" ");
+    }
+    Serial.println();
+}
 
 
-// put function declarations here:
-
-void setup() {
-  // put your setup code here, to run once:
-      /* LED_DI Init */
-  pinMode(LED_BOARD, OUTPUT);
-  digitalWrite(LED_BOARD, 0);
-
-  delay(2000); // Delay a bit to let the user actually see the start of the program
-
+/* **********************************************************/
+/* ******************** Setup Finction ******************** */
+/* **********************************************************/
+void setup()
+{
+  // Initialize the LED pin as an output
+  pinMode(LED_ONBOARD, OUTPUT);
+  digitalWrite(LED_ONBOARD, 0);
+  
+  // Initialize the Serial port
   Serial.begin(921600);
-  while (!Serial) {
-    ; // Wait for serial port to connect. Needed for native USB port only
+  // Wait for serial to initialize
+  while(0 >= Serial.read())
+  {
+    delay(10);
   }
 
-  Serial.println("Starting Arduino BLE Client application...");
-  BLEDevice::init("");
+  // Initialize the I2C bus for Time of Flight sensor
+  I2CTOF.begin(I2C_IMU_SDA, I2C_IMU_SCL, 400000);
 
-  // Retrieve a Scanner and set the callback we want to use to be informed when we
-  // have detected a new device.  Specify that we want active scanning and start the
-  // scan to run for 5 seconds.
-  BLEScan* pBLEScan = BLEDevice::getScan();
-  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-  pBLEScan->setInterval(1349);
-  pBLEScan->setWindow(449);
-  pBLEScan->setActiveScan(true);
-  pBLEScan->start(5, false);
+  // Initialize the Time of Flight sensor
+  TOF_available = tof.begin(0x29, false, &I2CTOF);
+  if (!TOF_available)
+  {
+    Serial.println(F("Failed to boot VL53L0X"));
+  }
+  else
+  {
+    Serial.println(F("VL53L0X Booted"));
+  }
 
-  serialReady = true; // Indicate that serial communication is ready
+  // Initialize WIFI in station mode
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+
+  // Initialize the ESP-NOW as a Slave
+  if(esp_now_init() != ESP_OK)
+  {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+  else
+  {
+    Serial.println("ESP-NOW Initialized");
+  }
+  
+  // Register the callback function to be called when data is received
+  esp_now_register_recv_cb(onDataRecv);
+
 }
 
-void loop() {
-  
-  // Wait until serial communication is established
-  if (!serialReady) {
-    return;
-  }  
 
- 
-  // If the flag "doConnect" is true then we have scanned for and found the desired
-  // BLE Server with which we wish to connect.  Now we connect to it.  Once we are 
-  // connected we set the connected flag to be true.
-  if (doConnect == true) {
-    if (connectToServer()) {
-      Serial.println("We are now connected to the BLE Server.");
-    } else {
-      Serial.println("We have failed to connect to the server; there is nothin more we will do.");
-    }
-    doConnect = false;
-  }
-  else
-  {
-    Serial.println("Not connected / doConnect == false");
-  }
-  
+/* *************************************************** */
+/* ******************** Main Loop ******************** */
+/* *************************************************** */
+void loop()
+{
+  // run scheduler
+  schRun();
+}
 
-  // If we are connected to a peer BLE Server, update the characteristic each time we are reached
-  // with the current time since boot.
-  if (connected) {
-    std::string rxValue = pRemoteChar_2->readValue();
-    Serial.print("Characteristic 2 (readValue): ");
-    Serial.println(rxValue.c_str());
-    
-    String txValue = "String with random value from client: " + String(-random(1000));
-    Serial.println("Characteristic 2 (writeValue): " + txValue);
-    
-    // Set the characteristic's value to be the array of bytes that is actually a string.
-    pRemoteChar_2->writeValue(txValue.c_str(), txValue.length());
-    digitalWrite(LED_BOARD, 1);
-  }else if(doScan){
-    BLEDevice::getScan()->start(0);  // this is just example to start scan after disconnect, most likely there is better way to do it in arduino
-    Serial.println("Scanning...");
-    digitalWrite(LED_BOARD, 0);
-  }
-  else
+
+/* *************************************************** */
+/* ******************** Scheduler ******************** */
+/* *************************************************** */
+void schRun()
+{
+  schTimeUs = micros();
+  if ((schTimeUs - schLast20msTaskExecutionUs) >= SCH_20MS_TASK_PERIOD)
   {
-    Serial.println("Not connected / doScan == false");
-    if(LEDFlag)
+    task_20ms();
+    schLast20msTaskExecutionUs += SCH_20MS_TASK_PERIOD;
+  }
+  else if((schTimeUs - schLast100msTaskExecutionUs) >= SCH_100MS_TASK_PERIOD) {
+    task_100ms();
+    schLast100msTaskExecutionUs += SCH_100MS_TASK_PERIOD;
+  }
+  else if ((schTimeUs - schLast500msTaskExecutionUs) >= SCH_500MS_TASK_PERIOD)
+  {
+    task_500ms();
+    schLast500msTaskExecutionUs += SCH_500MS_TASK_PERIOD;
+  }
+}
+
+
+/* **************************************************** */
+/* ********************* 20ms Task ******************** */
+/* **************************************************** */
+void task_20ms()
+{
+  if(dataReceived)
+  {
+    Serial.println("Data Received");
+    Serial.print("Data: ");
+    for(int i = 0; i < dataLength; i++)
     {
-      digitalWrite(LED_BOARD, 1);
-      LEDFlag = false;
+      Serial.print(incomingData[i]);
+      Serial.print(" ");
+    }
+    Serial.println();
+    dataReceived = false;
+    LEDCounter = incomingData[0] * 20;
+  }
+
+  if(LEDCounter)
+  {
+    digitalWrite(LED_ONBOARD, 0);
+    LEDCounter--;
+  }
+  else
+  {
+    digitalWrite(LED_ONBOARD, 1);
+  }
+
+
+
+/*
+  if(incomingData[0] == 0x01)
+  {
+    Serial.println("Sending Response");
+    esp_now_send(NULL, responseData, 8);
+  }
+*/
+}
+
+
+/* **************************************************** */
+/* ******************** 100ms Task ******************** */
+/* **************************************************** */
+void task_100ms()
+{
+  VL53L0X_RangingMeasurementData_t measure;
+
+  if(TOF_available)
+  {
+    Serial.print("Reading a measurement... ");
+    tof.rangingTest(&measure, false); // pass in 'true' to get debug data printout!
+
+    if (measure.RangeStatus != 4)   // phase failures have incorrect data
+    {
+      Serial.print("Distance (mm): "); Serial.println(measure.RangeMilliMeter);
     }
     else
     {
-      digitalWrite(LED_BOARD, 0);
-      LEDFlag = true;
+      Serial.println(" out of range ");
     }
   }
 
-  // In this example "delay" is used to delay with one second. This is of course a very basic 
-  // implementation to keep things simple. I recommend to use millis() for any production code
-  delay(500);
-
 }
 
+
+/* **************************************************** */
+/* ******************** 500ms Task ******************** */
+/* **************************************************** */
+void task_500ms()
+{
+  LEDFlag = !LEDFlag;
+  digitalWrite(LED_ONBOARD, ((LEDFlag == true) ? 0:1) );
+  //readMacAddress();
+}
+
+
+void readMacAddress(){
+  uint8_t baseMac[6];
+  esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, baseMac);
+  if (ret == ESP_OK) {
+    Serial.printf("0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X\n",
+                  baseMac[0], baseMac[1], baseMac[2],
+                  baseMac[3], baseMac[4], baseMac[5]);
+  } else {
+    Serial.println("Failed to read MAC address");
+  }
+}
